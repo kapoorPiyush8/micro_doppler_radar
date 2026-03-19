@@ -1,0 +1,498 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import signal
+from scipy.ndimage import gaussian_filter1d
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==========================================================
+# HRRP SIMULATION FOR AIRCRAFT CLASSIFICATION
+# ==========================================================
+
+class HRRPSimulator:
+    """
+    High Range Resolution Profile Simulator for Aircraft Classification
+    Simulates RCS distribution along the aircraft's length (phase center)
+    """
+    
+    def __init__(self, fc=10e9, B=1e9, fc_ratio=0.1):
+        """
+        Initialize HRRP Simulator
+        
+        Parameters:
+        -----------
+        fc : float
+            Carrier frequency (Hz) - default 10 GHz
+        B : float
+            Bandwidth (Hz) - default 1 GHz gives 0.15m range resolution
+        fc_ratio : float
+            Fluctuation correlation ratio (0.1 = 10% correlation)
+        """
+        self.c = 3e8  # Speed of light
+        self.fc = fc
+        self.B = B
+        self.fc_ratio = fc_ratio
+        
+        # Calculate range resolution
+        self.delta_r = self.c / (2 * B)
+        print(f"Range Resolution: {self.delta_r:.3f} m")
+        
+    def create_aircraft_model(self, aircraft_type):
+        """
+        Create simplified aircraft scattering center model
+        
+        Each aircraft is modeled as a series of point scatterers along its length
+        with positions and RCS values representing key features:
+        - Nose (radome)
+        - Cockpit
+        - Intakes
+        - Wing roots
+        - Engine nozzles
+        - Tail
+        """
+        
+        models = {
+            'F-16 Fighting Falcon': {
+                'length': 15.0,  # meters
+                'scatterers': [
+                    {'pos': 0.0, 'rcs': 0.8, 'name': 'Nose (Radome)'},
+                    {'pos': 2.5, 'rcs': 1.2, 'name': 'Cockpit'},
+                    {'pos': 4.5, 'rcs': 2.5, 'name': 'Intake'},
+                    {'pos': 6.0, 'rcs': 3.0, 'name': 'Wing Root'},
+                    {'pos': 9.0, 'rcs': 2.0, 'name': 'Mid-fuselage'},
+                    {'pos': 12.0, 'rcs': 2.8, 'name': 'Engine Nozzle'},
+                    {'pos': 14.0, 'rcs': 1.5, 'name': 'Tail'}
+                ]
+            },
+            'Su-35 Flanker': {
+                'length': 21.9,  # meters
+                'scatterers': [
+                    {'pos': 0.0, 'rcs': 1.0, 'name': 'Nose (PESA)'},
+                    {'pos': 3.0, 'rcs': 1.8, 'name': 'Cockpit'},
+                    {'pos': 5.5, 'rcs': 3.2, 'name': 'Canards'},
+                    {'pos': 8.0, 'rcs': 4.0, 'name': 'Intake/Wing'},
+                    {'pos': 12.0, 'rcs': 2.5, 'name': 'Main Wing'},
+                    {'pos': 16.0, 'rcs': 3.5, 'name': 'Twin Engines'},
+                    {'pos': 19.0, 'rcs': 2.0, 'name': 'Tail Boom'}
+                ]
+            },
+            'F-22 Raptor': {
+                'length': 18.9,  # meters
+                'scatterers': [
+                    {'pos': 0.0, 'rcs': 0.3, 'name': 'Stealth Nose'},
+                    {'pos': 2.8, 'rcs': 0.5, 'name': 'Cockpit'},
+                    {'pos': 5.0, 'rcs': 1.2, 'name': 'Intake Serpentine'},
+                    {'pos': 8.0, 'rcs': 0.8, 'name': 'Wing Root'},
+                    {'pos': 11.0, 'rcs': 0.6, 'name': 'Mid-fuselage'},
+                    {'pos': 14.0, 'rcs': 1.0, 'name': 'Engine Bay'},
+                    {'pos': 17.0, 'rcs': 0.4, 'name': 'Tail'}
+                ]
+            },
+            'MiG-29 Fulcrum': {
+                'length': 17.3,  # meters
+                'scatterers': [
+                    {'pos': 0.0, 'rcs': 0.9, 'name': 'Nose'},
+                    {'pos': 2.2, 'rcs': 1.5, 'name': 'Cockpit'},
+                    {'pos': 4.5, 'rcs': 2.8, 'name': 'Intake'},
+                    {'pos': 7.0, 'rcs': 2.2, 'name': 'Wing'},
+                    {'pos': 10.0, 'rcs': 3.0, 'name': 'Engine'},
+                    {'pos': 13.5, 'rcs': 1.8, 'name': 'Tail'}
+                ]
+            },
+            'MQ-9 Reaper (UAV)': {
+                'length': 11.0,  # meters
+                'scatterers': [
+                    {'pos': 0.0, 'rcs': 0.4, 'name': 'Sensor Ball'},
+                    {'pos': 2.0, 'rcs': 0.6, 'name': 'Fuselage'},
+                    {'pos': 4.5, 'rcs': 1.8, 'name': 'Wing/Fuel'},
+                    {'pos': 7.0, 'rcs': 1.2, 'name': 'Engine'},
+                    {'pos': 9.5, 'rcs': 0.5, 'name': 'Tail'}
+                ]
+            }
+        }
+        
+        return models.get(aircraft_type, models['F-16 Fighting Falcon'])
+    
+    def generate_hrrp(self, aircraft_model, aspect_angle=0, snr_db=30, 
+                     num_freq=256, fluctuation='swerling1'):
+        """
+        Generate HRRP for given aircraft at specified aspect angle
+        
+        Parameters:
+        -----------
+        aircraft_model : dict
+            Aircraft model with scatterers
+        aspect_angle : float
+            Aspect angle in degrees (0 = nose-on, 90 = broadside)
+        snr_db : float
+            Signal-to-noise ratio in dB
+        num_freq : int
+            Number of frequency steps
+        fluctuation : str
+            RCS fluctuation model ('swerling1', 'swerling2', 'none')
+        """
+        
+        # Extract scatterer positions and RCS
+        scatterers = aircraft_model['scatterers']
+        length = aircraft_model['length']
+        
+        # Apply aspect angle effect
+        # At non-zero aspect, the projected length changes
+        aspect_rad = np.radians(aspect_angle)
+        proj_factor = np.cos(aspect_rad)
+        
+        # Adjust positions based on aspect
+        positions = np.array([s['pos'] for s in scatterers])
+        # Normalize to [0, 1] range for projection
+        positions_norm = positions / length
+        # Apply projection (compression along LOS)
+        positions_proj = positions_norm * proj_factor * length
+        
+        # Get base RCS values
+        rcs_values = np.array([s['rcs'] for s in scatterers])
+        
+        # Apply RCS fluctuation (Swerling models)
+        if fluctuation == 'swerling1':
+            # Slow fluctuation (scan-to-scan)
+            rcs_values *= np.random.exponential(1, len(rcs_values))
+        elif fluctuation == 'swerling2':
+            # Fast fluctuation (pulse-to-pulse)
+            rcs_values *= np.random.rayleigh(1, len(rcs_values))
+        
+        # Generate frequency domain response
+        freq = np.linspace(self.fc - self.B/2, self.fc + self.B/2, num_freq)
+        k = 2 * np.pi * freq / self.c  # Wavenumber
+        
+        # Construct frequency response (sum of scatterers)
+        H_f = np.zeros(len(freq), dtype=complex)
+        
+        for pos, rcs in zip(positions_proj, rcs_values):
+            # Phase delay due to round trip
+            phase = -2j * k * pos
+            H_f += np.sqrt(rcs) * np.exp(phase)
+        
+        # Add aspect-dependent shading (scatterers may be occluded)
+        if aspect_angle > 60:
+            # At high aspects, some scatterers are shadowed
+            occlusion = np.exp(-(positions_proj - length/2)**2 / (length/4)**2)
+            H_f *= np.sum(occlusion) / len(occlusion)
+        
+        # Convert to time domain (HRRP) via IFFT
+        hrrp = np.fft.ifft(H_f, n=4*num_freq)
+        hrrp = np.fft.fftshift(hrrp)  # Center the profile
+        
+        # Create range axis
+        range_max = self.c / (2 * self.delta_r)
+        range_axis = np.linspace(-range_max/2, range_max/2, len(hrrp))
+        
+        # Add noise
+        signal_power = np.mean(np.abs(hrrp)**2)
+        noise_power = signal_power / (10**(snr_db/10))
+        noise = np.sqrt(noise_power/2) * (np.random.randn(len(hrrp)) + 
+                                          1j*np.random.randn(len(hrrp)))
+        hrrp_noisy = hrrp + noise
+        
+        return range_axis, np.abs(hrrp_noisy), positions_proj, rcs_values
+    
+    def extract_features(self, hrrp_profile, range_axis):
+        """
+        Extract classification features from HRRP
+        """
+        features = {}
+        
+        # Normalize profile
+        profile_norm = hrrp_profile / np.max(hrrp_profile)
+        
+        # 1. Length estimate (where profile > threshold)
+        threshold = 0.2  # 20% of peak
+        above_thresh = np.where(profile_norm > threshold)[0]
+        if len(above_thresh) > 0:
+            length_estimate = range_axis[above_thresh[-1]] - range_axis[above_thresh[0]]
+            features['length_estimate'] = length_estimate
+        else:
+            features['length_estimate'] = 0
+        
+        # 2. Number of prominent peaks
+        from scipy.signal import find_peaks
+        peaks, properties = find_peaks(profile_norm, height=0.3, distance=5)
+        features['num_peaks'] = len(peaks)
+        features['peak_positions'] = range_axis[peaks]
+        features['peak_heights'] = properties['peak_heights']
+        
+        # 3. Energy distribution (centroid and spread)
+        energy = profile_norm**2
+        if np.sum(energy) > 0:
+            centroid = np.sum(range_axis * energy) / np.sum(energy)
+            spread = np.sqrt(np.sum((range_axis - centroid)**2 * energy) / np.sum(energy))
+        else:
+            centroid = 0
+            spread = 0
+        features['centroid'] = centroid
+        features['spread'] = spread
+        
+        # 4. Profile moments (skewness, kurtosis)
+        from scipy.stats import skew, kurtosis
+        features['skewness'] = skew(profile_norm)
+        features['kurtosis'] = kurtosis(profile_norm)
+        
+        return features
+
+# ==========================================================
+# DEMONSTRATION AND VISUALIZATION
+# ==========================================================
+
+def demonstrate_hrrp_classification():
+    """
+    Demonstrate HRRP for aircraft classification
+    """
+    
+    # Initialize simulator
+    simulator = HRRPSimulator(fc=10e9, B=1e9)
+    
+    # Define aircraft to classify
+    aircraft_list = [
+        'F-16 Fighting Falcon',
+        'Su-35 Flanker',
+        'F-22 Raptor',
+        'MiG-29 Fulcrum',
+        'MQ-9 Reaper (UAV)'
+    ]
+    
+    # Generate HRRP for each aircraft at multiple aspects
+    aspects = [0, 30, 60]  # nose-on, 30°, 60°
+    
+    # Create figure
+    fig = plt.figure(figsize=(20, 15))
+    
+    # Store features for classification
+    all_features = []
+    
+    for i, aircraft in enumerate(aircraft_list):
+        print(f"\n{'='*60}")
+        print(f"Processing: {aircraft}")
+        print('='*60)
+        
+        # Get aircraft model
+        model = simulator.create_aircraft_model(aircraft)
+        
+        # Create subplot grid for this aircraft
+        for j, aspect in enumerate(aspects):
+            # Generate HRRP
+            range_axis, hrrp, positions, rcs = simulator.generate_hrrp(
+                model, aspect_angle=aspect, snr_db=25, fluctuation='swerling1'
+            )
+            
+            # Extract features
+            features = simulator.extract_features(hrrp, range_axis)
+            all_features.append({
+                'aircraft': aircraft,
+                'aspect': aspect,
+                'features': features
+            })
+            
+            # Plot HRRP
+            ax = plt.subplot(len(aircraft_list), len(aspects), 
+                           i*len(aspects) + j + 1)
+            
+            # Plot HRRP
+            ax.plot(range_axis, hrrp, 'b-', linewidth=1.5, alpha=0.7)
+            
+            # Mark true scatterer positions
+            for pos, rcs_val in zip(positions, rcs):
+                ax.axvline(x=pos, color='r', linestyle='--', 
+                          alpha=0.5, linewidth=1)
+                ax.plot(pos, rcs_val * 0.1, 'ro', markersize=3)
+            
+            # Formatting
+            ax.set_xlim([-15, 25])
+            ax.set_ylim([0, None])
+            ax.grid(True, alpha=0.3)
+            
+            if j == 0:
+                ax.set_ylabel(f'{aircraft}\nMagnitude', fontsize=9)
+            if i == len(aircraft_list) - 1:
+                ax.set_xlabel('Range (m)', fontsize=9)
+            
+            ax.set_title(f'Aspect: {aspect}°', fontsize=10)
+            
+            # Annotate with key features
+            feature_text = (f"Peaks: {features['num_peaks']}\n"
+                          f"Length: {features['length_estimate']:.1f}m")
+            ax.text(0.95, 0.95, feature_text, 
+                   transform=ax.transAxes,
+                   verticalalignment='top',
+                   horizontalalignment='right',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                   fontsize=8)
+    
+    plt.suptitle('HRRP Signatures for Different Aircraft at Multiple Aspects\n'
+                'Red dashed lines: True scatterer positions', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+    
+    return all_features
+
+def demonstrate_classification_metrics(all_features):
+    """
+    Show how features can be used for classification
+    """
+    
+    print("\n" + "="*70)
+    print("CLASSIFICATION FEATURES ANALYSIS")
+    print("="*70)
+    
+    # Group features by aircraft
+    aircraft_features = {}
+    for data in all_features:
+        aircraft = data['aircraft']
+        if aircraft not in aircraft_features:
+            aircraft_features[aircraft] = []
+        aircraft_features[aircraft].append(data['features'])
+    
+    # Create feature comparison plot
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    feature_names = ['length_estimate', 'num_peaks', 'centroid', 
+                    'spread', 'skewness', 'kurtosis']
+    titles = ['Length (m)', 'Number of Peaks', 'Centroid Position (m)',
+             'Energy Spread (m)', 'Skewness', 'Kurtosis']
+    
+    colors = plt.cm.Set3(np.linspace(0, 1, len(aircraft_features)))
+    
+    for idx, (feature_name, title) in enumerate(zip(feature_names, titles)):
+        ax = axes.flatten()[idx]
+        
+        x_pos = np.arange(len(aircraft_features))
+        means = []
+        stds = []
+        labels = []
+        
+        for i, (aircraft, features_list) in enumerate(aircraft_features.items()):
+            values = [f[feature_name] for f in features_list]
+            means.append(np.mean(values))
+            stds.append(np.std(values))
+            labels.append(aircraft.split()[0])  # Short name
+            
+        ax.bar(x_pos, means, yerr=stds, capsize=5, color=colors)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(labels, rotation=45, ha='right')
+        ax.set_ylabel(title)
+        ax.grid(True, alpha=0.3)
+        ax.set_title(f'Feature: {title}')
+    
+    plt.suptitle('Feature Distribution Across Aircraft Types\n'
+                '(Bars show mean ± std over multiple aspects)', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+    
+    # Print feature summary
+    print("\nFEATURE SUMMARY (mean ± std):")
+    print("-"*70)
+    for aircraft, features_list in aircraft_features.items():
+        print(f"\n{aircraft}:")
+        for feature_name in feature_names[:3]:  # First 3 features
+            values = [f[feature_name] for f in features_list]
+            print(f"  {feature_name:20s}: {np.mean(values):6.2f} ± {np.std(values):5.2f}")
+
+def demonstrate_aspect_sensitivity():
+    """
+    Show how HRRP changes with aspect angle
+    """
+    
+    simulator = HRRPSimulator(fc=10e9, B=1e9)
+    
+    # Choose one aircraft
+    aircraft = 'F-16 Fighting Falcon'
+    model = simulator.create_aircraft_model(aircraft)
+    
+    # Generate HRRP at multiple aspects
+    aspects = np.arange(0, 91, 15)  # 0° to 90° in 15° steps
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    axes = axes.flatten()
+    
+    for idx, aspect in enumerate(aspects):
+        range_axis, hrrp, positions, rcs = simulator.generate_hrrp(
+            model, aspect_angle=aspect, snr_db=30
+        )
+        
+        ax = axes[idx]
+        
+        # Plot HRRP
+        ax.plot(range_axis, hrrp, 'b-', linewidth=1.5)
+        
+        # Mark true scatterer positions
+        for pos in positions:
+            ax.axvline(x=pos, color='r', linestyle='--', alpha=0.5)
+        
+        ax.set_xlim([-10, 20])
+        ax.set_ylim([0, None])
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel('Range (m)')
+        ax.set_ylabel('Magnitude')
+        ax.set_title(f'Aspect: {aspect}°')
+        
+        # Annotate projected length
+        proj_length = np.max(positions) - np.min(positions)
+        ax.text(0.95, 0.95, f'Proj Length: {proj_length:.1f}m',
+               transform=ax.transAxes, ha='right', va='top',
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.suptitle(f'Aspect Sensitivity of HRRP - {aircraft}', 
+                fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================================
+# MAIN EXECUTION
+# ==========================================================
+
+if __name__ == "__main__":
+    
+    print("="*70)
+    print("HRRP SIMULATION FOR AIRCRAFT CLASSIFICATION")
+    print("="*70)
+    print("\nThis simulation demonstrates High Range Resolution Profiles")
+    print("for different aircraft types. HRRP reveals RCS variation along")
+    print("the aircraft's length, creating unique signatures for classification.")
+    
+    # Demonstrate basic HRRP for multiple aircraft
+    print("\n[1] Generating HRRP signatures for different aircraft...")
+    all_features = demonstrate_hrrp_classification()
+    
+    # Show how features can be used for classification
+    print("\n[2] Analyzing classification features...")
+    demonstrate_classification_metrics(all_features)
+    
+    # Show aspect sensitivity
+    print("\n[3] Demonstrating aspect sensitivity...")
+    demonstrate_aspect_sensitivity()
+    
+    # Example of using HRRP for target identification
+    print("\n" + "="*70)
+    print("CLASSIFICATION EXAMPLE")
+    print("="*70)
+    print("\nTo identify an unknown target:")
+    print("1. Measure HRRP at known aspect")
+    print("2. Extract features (length, peak locations, energy distribution)")
+    print("3. Compare features against database using classifier")
+    print("4. Identify aircraft type based on feature matching")
+    
+    print("\nKey Insights for Classification:")
+    print("- Stealth aircraft (F-22) show lower overall RCS")
+    print("- Different aircraft have unique scatterer patterns")
+    print("- Aspect angle significantly affects profile (must be considered)")
+    print("- Features like length, peak count, and skewness are discriminative")
+    
+    print("\nLimitations:")
+    print("- Real HRRP includes clutter, multipath, and atmospheric effects")
+    print("- Aspect ambiguity requires multiple looks or tracking")
+    print("- Target motion can blur the profile (Doppler effects)")
+    
+    print("\nNext Steps for Production System:")
+    print("1. Use EM simulation tools (CST, FEKO) with accurate CAD models")
+    print("2. Collect real measurements from instrumentation radars")
+    print("3. Implement robust classifiers (CNN, SVM, Random Forest)")
+    print("4. Account for aspect angle in classification pipeline")
